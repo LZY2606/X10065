@@ -1,0 +1,300 @@
+import me.champeau.jmh.JmhBytecodeGeneratorTask
+import org.gradle.internal.os.OperatingSystem
+
+import java.time.Duration
+
+plugins {
+    id 'java'
+    id 'scala'
+    id 'me.champeau.jmh' version '0.7.1'
+    id 'pl.allegro.tech.build.axion-release' version '1.21.1'
+    id 'io.github.gradle-nexus.publish-plugin' version '2.0.0'
+    id 'maven-publish'
+    id 'signing'
+}
+
+scmVersion {
+    versionCreator('versionWithBranch')
+    tag {
+        prefix.set('')
+    }
+}
+
+group = 'org.simdjson'
+version = scmVersion.version
+
+repositories {
+    mavenCentral()
+}
+
+// --- Java Version Resolution ---
+static int resolveBuildJavaVersion() {
+    String v = System.getenv('BUILD_JAVA_VERSION') ?: JavaVersion.current().majorVersion
+
+    int dot = v.indexOf('.')
+    if (dot >= 0) {
+        v = v.substring(0, dot)
+    }
+
+    int dash = v.indexOf('-')
+    if (dash >= 0) {
+        v = v.substring(0, dash)
+    }
+
+    try {
+        return Integer.parseInt(v)
+    } catch (Exception e) {
+        throw new GradleException("Invalid BUILD_JAVA_VERSION '${System.getenv('BUILD_JAVA_VERSION')}'. " +
+                "Expected a Java major version like '24' (optionally with suffixes like '24.0.1' or '24-ea').", e)
+    }
+}
+
+def buildJavaVersion = resolveBuildJavaVersion()
+
+if (buildJavaVersion < 24) {
+    throw new GradleException(
+            "This build requires Java 24+.\n" +
+                    "Detected buildJavaVersion=${buildJavaVersion}.\n" +
+                    "Either run Gradle with JDK 24+ (JAVA_HOME / PATH), or set BUILD_JAVA_VERSION=24 (or higher)."
+    )
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(buildJavaVersion)
+    }
+    withJavadocJar()
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.toVersion(buildJavaVersion)
+    targetCompatibility = JavaVersion.toVersion(buildJavaVersion)
+}
+
+ext {
+    junitVersion = '5.12.0'
+    jsoniterScalaVersion = '2.33.2'
+}
+
+dependencies {
+    jmhImplementation group: 'com.fasterxml.jackson.core', name: 'jackson-databind', version: '2.18.2'
+    jmhImplementation group: 'com.alibaba.fastjson2', name: 'fastjson2', version: '2.0.56'
+    jmhImplementation group: 'com.github.plokhotnyuk.jsoniter-scala', name: 'jsoniter-scala-core_2.13', version: jsoniterScalaVersion
+    jmhImplementation group: 'com.google.guava', name: 'guava', version: '33.4.0-jre'
+    compileOnly group: 'com.github.plokhotnyuk.jsoniter-scala', name: 'jsoniter-scala-macros_2.13', version: jsoniterScalaVersion
+
+    testImplementation group: 'org.assertj', name: 'assertj-core', version: '3.27.3'
+    testImplementation group: 'org.apache.commons', name: 'commons-text', version: '1.13.0'
+    testImplementation group: 'org.junit-pioneer', name: 'junit-pioneer', version: '2.3.0'
+    testImplementation group: 'org.junit.jupiter', name: 'junit-jupiter-api', version: junitVersion
+    testImplementation group: 'org.junit.jupiter', name: 'junit-jupiter-params', version: junitVersion
+    testRuntimeOnly group: 'org.junit.jupiter', name: 'junit-jupiter-engine', version: junitVersion
+}
+
+// --- Test Data Preparation ---
+def testdataParent = layout.projectDirectory.dir("testdata")
+def repoDir = testdataParent.dir("parse-number-fxx-test-data")
+
+tasks.register('prepareTestDataDir') {
+    description = 'Create testdata/ directory if missing'
+    doLast {
+        def parent = testdataParent.asFile
+        if (!parent.exists()) {
+            logger.lifecycle("Creating ${parent}")
+            parent.mkdirs()
+        }
+    }
+}
+
+tasks.register('downloadTestData', Exec) {
+    description = 'Clone parse-number-fxx-test-data into testdata/ if missing'
+    group = 'verification'
+    dependsOn tasks.named('prepareTestDataDir')
+
+    // Run if repo dir missing OR empty (handles half-created directories)
+    onlyIf {
+        def d = repoDir.asFile
+        !d.exists() || (d.isDirectory() && (d.listFiles() == null || d.listFiles().length == 0))
+    }
+
+    workingDir testdataParent.asFile
+    commandLine 'git', 'clone', 'https://github.com/nigeltao/parse-number-fxx-test-data.git', 'parse-number-fxx-test-data'
+
+    doFirst {
+        logger.lifecycle("Cloning parse-number-fxx-test-data into ${repoDir.asFile}")
+    }
+}
+
+// Configuration common to ALL Test tasks (including 'test', 'test256', 'test512')
+tasks.withType(Test).configureEach {
+    dependsOn tasks.named('downloadTestData')
+
+    // Fix: Ensure logging is visible in the console
+    testLogging {
+        showStandardStreams = true
+        events 'PASSED', 'SKIPPED', 'FAILED', 'STANDARD_OUT', 'STANDARD_ERROR'
+        exceptionFormat = 'full'
+        showExceptions = true
+        showCauses = true
+        showStackTraces = true
+    }
+}
+
+// --- Test Variants (256/512) ---
+test {
+    useJUnitPlatform()
+    jvmArgs += [
+            '--add-modules', 'jdk.incubator.vector', '-Xmx2g'
+    ]
+    failOnNoDiscoveredTests = false
+}
+
+// Generate test tasks for specific species (256, 512)
+[256, 512].each { species ->
+    tasks.register("test${species}", Test) {
+        group = 'verification'
+        description = "Runs tests with org.simdjson.species=${species}"
+
+        // Fix: Removed 'dependsOn test'. This allows test256 to run independently.
+        // We use mustRunAfter so they don't interleave output if run together via 'check'.
+        dependsOn tasks.named('test')
+
+        useJUnitPlatform()
+        jvmArgs += [
+                '--add-modules', 'jdk.incubator.vector',
+                '-Xmx2g',
+                "-Dorg.simdjson.species=${species}"
+        ]
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('test256')
+    dependsOn tasks.named('test512')
+}
+
+tasks.withType(JmhBytecodeGeneratorTask).configureEach {
+    jvmArgs.set(["--add-modules=jdk.incubator.vector"])
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs.add("--add-modules=jdk.incubator.vector")
+}
+
+tasks.compileJmhScala.classpath = sourceSets.main.compileClasspath
+tasks.compileJmhJava.classpath += files(sourceSets.jmh.scala.classesDirectory)
+
+compileTestJava {
+    options.compilerArgs += [
+            '--add-modules', 'jdk.incubator.vector'
+    ]
+}
+
+javadoc.options {
+    addStringOption('-add-modules', 'jdk.incubator.vector')
+}
+
+jmh {
+    fork = 1
+    warmupIterations = 3
+    iterations = 5
+    jvmArgsPrepend = [
+            '--add-modules=jdk.incubator.vector'
+    ]
+    if (OperatingSystem.current().isLinux()) {
+        def profilerList = []
+        if (getBooleanProperty('jmh.asyncProfilerEnabled', false)) {
+            createDirIfDoesNotExist('./profilers/async')
+            profilerList += ['async:verbose=true;output=flamegraph;event=cpu;dir=./profilers/async;libPath=' + getLibPath('LD_LIBRARY_PATH')]
+        }
+        if (getBooleanProperty('jmh.perfAsmEnabled', false)) {
+            createDirIfDoesNotExist('./profilers/perfasm')
+            profilerList += ['perfasm:intelSyntax=true;saveLog=true;saveLogTo=./profilers/perfasm']
+        }
+        if (getBooleanProperty('jmh.perfEnabled', false)) {
+            profilerList += ['perf']
+        }
+        profilers = profilerList
+    }
+    if (project.hasProperty('jmh.includes')) {
+        includes = [project.findProperty('jmh.includes')]
+    }
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from(components.java)
+
+            pom {
+                name = project.name
+                description = 'A Java version of simdjson, a high-performance JSON parser utilizing SIMD instructions.'
+                url = 'https://github.com/simdjson/simdjson-java'
+                issueManagement {
+                    system = 'GitHub Issue Tracking'
+                    url = 'https://github.com/simdjson/simdjson-java/issues'
+                }
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                developers {
+                    developer {
+                        id = 'piotrrzysko'
+                        name = 'Piotr Rżysko'
+                        email = 'piotr.rzysko@gmail.com'
+                    }
+                }
+                scm {
+                    url = 'https://github.com/simdjson/simdjson-java'
+                    connection = 'scm:git@github.com:simdjson/simdjson-java.git'
+                    developerConnection = 'scm:git@github.com:simdjson/simdjson-java.git'
+                }
+            }
+        }
+    }
+}
+
+if (System.getenv('GPG_KEY_ID')) {
+    signing {
+        useInMemoryPgpKeys(
+                System.getenv('GPG_KEY_ID'),
+                System.getenv('GPG_PRIVATE_KEY'),
+                System.getenv('GPG_PRIVATE_KEY_PASSWORD')
+        )
+        sign publishing.publications.mavenJava
+    }
+}
+
+nexusPublishing {
+    repositories {
+        sonatype {
+            nexusUrl.set(uri("https://ossrh-staging-api.central.sonatype.com/service/local/"))
+            snapshotRepositoryUrl.set(uri("https://central.sonatype.com/repository/maven-snapshots/"))
+
+            if (System.getenv('SONATYPE_USERNAME')) {
+                username.set(System.getenv('SONATYPE_USERNAME'))
+            }
+            if (System.getenv('SONATYPE_PASSWORD')) {
+                password.set(System.getenv('SONATYPE_PASSWORD'))
+            }
+
+            stagingProfileId.set('3c0bbfe420699e')
+        }
+    }
+    connectTimeout.set(Duration.ofMinutes(3))
+    clientTimeout.set(Duration.ofMinutes(3))
+}
+
+def getBooleanProperty(String name, boolean defaultValue) {
+    Boolean.valueOf((project.findProperty(name) ?: defaultValue) as String)
+}
+
+static def getLibPath(String envVarName) {
+    System.getenv(envVarName) ?: System.getProperty('java.library.path')
+}
+
+static createDirIfDoesNotExist(String dir) {
+    File file = new File(dir)
+    file.mkdirs()
+}
