@@ -163,7 +163,9 @@ class Utf8Validator {
         }
 
         if ((errors | previousIncomplete) != 0) {
-            throw new JsonParsingException("The input is not valid UTF-8");
+            // The error offset is localized by the shared scalar locator so that the SIMD and
+            // scalar stage1 paths always report the same offset for the same input.
+            throw new JsonParsingException("The input is not valid UTF-8", Utf8ErrorLocator.locateFirstError(buffer, length));
         }
     }
 

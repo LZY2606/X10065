@@ -38,11 +38,14 @@ class VectorUtils {
     }
 
     static ByteVector repeat(byte[] array) {
-        int n = BYTE_SPECIES.vectorByteSize() / 4;
-        byte[] result = new byte[n * array.length];
+        return repeat(array, BYTE_SPECIES);
+    }
+
+    static ByteVector repeat(byte[] array, VectorSpecies<Byte> species) {
+        byte[] result = new byte[species.vectorByteSize()];
         for (int dst = 0; dst < result.length; dst += array.length) {
             System.arraycopy(array, 0, result, dst, array.length);
         }
-        return ByteVector.fromArray(BYTE_SPECIES, result, 0);
+        return ByteVector.fromArray(species, result, 0);
     }
 }

@@ -58,6 +58,7 @@ hs_err_pid*
 replay_pid*
 */.gradle/*
 # --- 依赖与构建产物（不进交付快照）---
+testdata/
 node_modules/
 bower_components/
 .pnp.*
